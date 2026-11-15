@@ -141,7 +141,6 @@ type InternalTrack = {
 	sampleTableByteOffset: number | null; // null when the track's sample table is another file (ominous ik 👀)
 	sampleTable: SampleTable | null;
 	fragmentLookupTable: FragmentLookupTableEntry[];
-	currentFragmentState: FragmentTrackState | null;
 	/**
 	 * List of all encountered fragment offsets alongside their timestamps. This list never gets truncated, but memory
 	 * consumption should be negligible.
@@ -248,6 +247,7 @@ type FragmentLookupTableEntry = {
 	sampleNumber: number; // 1-indexed
 };
 
+// Maintained for every track, even the ones we don't care about
 type FragmentTrackState = {
 	baseDataOffset: number;
 	sampleDescriptionIndex: number | null;
@@ -256,14 +256,15 @@ type FragmentTrackState = {
 	defaultSampleFlags: number | null;
 	startTimestamp: number | null;
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
-};
-
-type FragmentTrackData = {
-	track: InternalTrack;
 
 	// Kept as state for the presence of multiple trun boxes
+	currentOffset: number | null; // null before the first trun
 	currentTimestamp: number;
-	currentOffset: number;
+};
+
+// Maintained only for the tracks we care about
+type FragmentTrackData = {
+	track: InternalTrack;
 
 	startTimestamp: number;
 	endTimestamp: number;
@@ -354,6 +355,7 @@ export class IsobmffDemuxer extends Demuxer {
 	psshBoxes: PsshBox[] = [];
 	currentFragment: Fragment | null = null;
 	isReadingTraf = false;
+	currentFragmentTrackState: FragmentTrackState | null = null;
 	/**
 	 * Caches the last fragment that was read. Based on the assumption that there will be multiple reads to the
 	 * same fragment in quick succession.
@@ -554,7 +556,6 @@ export class IsobmffDemuxer extends Demuxer {
 				sampleTableByteOffset: null,
 				sampleTable: null,
 				fragmentLookupTable: [],
-				currentFragmentState: null,
 				fragmentPositionCache: [],
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
 				editListOffset: foreignTrack.editListOffset,
@@ -1035,7 +1036,6 @@ export class IsobmffDemuxer extends Demuxer {
 					sampleTableByteOffset: -1,
 					sampleTable: null,
 					fragmentLookupTable: [],
-					currentFragmentState: null,
 					fragmentPositionCache: [],
 					editListPreviousSegmentDurations: 0,
 					editListOffset: 0,
@@ -2371,6 +2371,7 @@ export class IsobmffDemuxer extends Demuxer {
 				} finally {
 					this.currentFragment = null;
 					this.currentTrack = null;
+					this.currentFragmentTrackState = null;
 				}
 			}; break;
 
@@ -2386,9 +2387,13 @@ export class IsobmffDemuxer extends Demuxer {
 					this.isReadingTraf = false;
 				}
 
+				const fragmentTrackState = this.currentFragmentTrackState;
+				this.currentFragmentTrackState = null;
+
 				// It is possible that there is no current track, for example when we don't care about the track
 				// referenced in the track fragment header.
 				if (this.currentTrack) {
+					assert(fragmentTrackState);
 					const trackData = this.currentFragment.trackData.get(this.currentTrack.id);
 					cond:
 					if (trackData) {
@@ -2426,22 +2431,18 @@ export class IsobmffDemuxer extends Demuxer {
 						trackData.startTimestamp = firstSample.presentationTimestamp;
 						trackData.endTimestamp = lastSample.presentationTimestamp + lastSample.duration;
 
-						const { currentFragmentState } = this.currentTrack;
-						assert(currentFragmentState);
-
-						if (currentFragmentState.startTimestamp !== null) {
-							offsetFragmentTrackDataByTimestamp(trackData, currentFragmentState.startTimestamp);
+						if (fragmentTrackState.startTimestamp !== null) {
+							offsetFragmentTrackDataByTimestamp(trackData, fragmentTrackState.startTimestamp);
 							trackData.startTimestampIsFinal = true;
 						}
 
 						// Transfer the buffered saiz+saio state onto the track data, so readFragment can resolve it
 						// once all boxes are parsed. Only relevant if senc wasn't already used to populate samples.
-						if (currentFragmentState.encryptionAuxInfo && !trackData.samples[0]!.encryption) {
-							trackData.encryptionAuxInfo = currentFragmentState.encryptionAuxInfo;
+						if (fragmentTrackState.encryptionAuxInfo && !trackData.samples[0]!.encryption) {
+							trackData.encryptionAuxInfo = fragmentTrackState.encryptionAuxInfo;
 						}
 					}
 
-					this.currentTrack.currentFragmentState = null;
 					this.currentTrack = null;
 				}
 			}; break;
@@ -2462,7 +2463,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 			case 'tfhd': {
 				// Only the first tfhd of a traf counts; anywhere else, there'd be no traf to finish the track data
-				if (!this.currentFragment || !this.isReadingTraf || this.currentTrack) {
+				if (!this.currentFragment || !this.isReadingTraf || this.currentFragmentTrackState) {
 					break;
 				}
 
@@ -2478,21 +2479,10 @@ export class IsobmffDemuxer extends Demuxer {
 				const defaultBaseIsMoof = Boolean(flags & 0x020000);
 
 				const trackId = readU32Be(slice);
-				const track = this.idToTrack.get(trackId);
-				if (!track) {
-					// We don't care about this track
-					break;
-				}
-
-				if (this.currentFragment.trackData.has(trackId)) {
-					Logging._warn(`Multiple traf boxes for track ${trackId} in the same moof box; skipping.`);
-					break;
-				}
-
 				const defaults = this.fragmentTrackDefaults.get(trackId);
 
-				this.currentTrack = track;
-				track.currentFragmentState = {
+				// Even tracks we ignore get this state, since their data still shifts the implicit base data offset
+				const fragmentTrackState: FragmentTrackState = {
 					baseDataOffset: this.currentFragment.implicitBaseDataOffset,
 					sampleDescriptionIndex: defaults?.defaultSampleDescriptionIndex ?? null,
 					defaultSampleDuration: defaults?.defaultSampleDuration ?? null,
@@ -2500,33 +2490,53 @@ export class IsobmffDemuxer extends Demuxer {
 					defaultSampleFlags: defaults?.defaultSampleFlags ?? null,
 					startTimestamp: null,
 					encryptionAuxInfo: null,
+					currentOffset: null,
+					currentTimestamp: 0,
 				};
+				this.currentFragmentTrackState = fragmentTrackState;
 
 				if (baseDataOffsetPresent) {
-					track.currentFragmentState.baseDataOffset = readU64Be(slice);
+					fragmentTrackState.baseDataOffset = readU64Be(slice);
 				} else if (defaultBaseIsMoof) {
-					track.currentFragmentState.baseDataOffset = this.currentFragment.moofOffset;
+					fragmentTrackState.baseDataOffset = this.currentFragment.moofOffset;
 				}
 				if (sampleDescriptionIndexPresent) {
-					track.currentFragmentState.sampleDescriptionIndex = readU32Be(slice);
+					fragmentTrackState.sampleDescriptionIndex = readU32Be(slice);
 				}
 				if (defaultSampleDurationPresent) {
-					track.currentFragmentState.defaultSampleDuration = readU32Be(slice);
+					fragmentTrackState.defaultSampleDuration = readU32Be(slice);
 				}
 				if (defaultSampleSizePresent) {
-					track.currentFragmentState.defaultSampleSize = readU32Be(slice);
+					fragmentTrackState.defaultSampleSize = readU32Be(slice);
 				}
 				if (defaultSampleFlagsPresent) {
-					track.currentFragmentState.defaultSampleFlags = readU32Be(slice);
+					fragmentTrackState.defaultSampleFlags = readU32Be(slice);
 				}
 				if (durationIsEmpty) {
-					track.currentFragmentState.defaultSampleDuration = 0;
+					fragmentTrackState.defaultSampleDuration = 0;
 				}
+
+				const track = this.idToTrack.get(trackId);
+				if (!track) {
+					// We don't care about this track
+					break;
+				}
+
+				if (this.currentFragment.trackData.has(trackId)) {
+					// Note that we don't actually skip the parsing of the trun. We can't, because it's necessary for
+					// incrementing the data offset.
+					Logging._warn(
+						`Multiple traf boxes for track ${trackId} in the same moof box; ignoring the samples of all but`
+						+ ' the first.',
+					);
+					break;
+				}
+
+				this.currentTrack = track;
 			}; break;
 
 			case 'tfdt': {
-				const track = this.currentTrack;
-				if (!track?.currentFragmentState) {
+				if (!this.currentFragmentTrackState) {
 					break;
 				}
 
@@ -2534,14 +2544,17 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(3); // Flags
 
 				const baseMediaDecodeTime = version === 0 ? readU32Be(slice) : readU64Be(slice);
-				track.currentFragmentState.startTimestamp = baseMediaDecodeTime;
+				this.currentFragmentTrackState.startTimestamp = baseMediaDecodeTime;
 			}; break;
 
 			case 'trun': {
-				const track = this.currentTrack;
-				if (!track?.currentFragmentState || !this.currentFragment) {
+				const fragmentTrackState = this.currentFragmentTrackState;
+				if (!fragmentTrackState || !this.currentFragment) {
 					break;
 				}
+
+				// Can be null if we don't care about the track (still needs parsing tho)
+				const track = this.currentTrack;
 
 				slice.skip(1); // Version
 				const flags = readU24Be(slice);
@@ -2554,7 +2567,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				const sampleCount = readU32Be(slice);
 
-				const { defaultSampleDuration, defaultSampleSize, defaultSampleFlags } = track.currentFragmentState;
+				const { defaultSampleDuration, defaultSampleSize, defaultSampleFlags } = fragmentTrackState;
 				if (
 					sampleCount > 0
 					&& (
@@ -2581,35 +2594,33 @@ export class IsobmffDemuxer extends Demuxer {
 					firstSampleFlags = readU32Be(slice);
 				}
 
-				let trackData: FragmentTrackData;
+				// "If the data-offset is not present, then the data for this run starts immediately after the data of
+				// the previous run, or at the base-data-offset defined by the track fragment header if this is the
+				// first run in a track fragment"
+				let currentOffset = dataOffset !== null
+					? fragmentTrackState.baseDataOffset + dataOffset
+					: fragmentTrackState.currentOffset ?? fragmentTrackState.baseDataOffset;
 
-				if (this.currentFragment.trackData.has(track.id)) {
-					trackData = this.currentFragment.trackData.get(track.id)!;
-
-					if (dataOffset !== null) {
-						trackData.currentOffset = track.currentFragmentState.baseDataOffset + dataOffset;
-					} else {
-						// "If the data-offset is not present, then the data for this run starts immediately after the
-						// data of the previous run"
+				let trackData: FragmentTrackData | null = null;
+				if (track) {
+					trackData = this.currentFragment.trackData.get(track.id) ?? null;
+					if (!trackData) {
+						trackData = {
+							track,
+							startTimestamp: 0,
+							endTimestamp: 0,
+							firstKeyFrameTimestamp: null,
+							samples: [],
+							presentationTimestamps: [],
+							startTimestampIsFinal: false,
+							trunSampleCounts: [],
+							encryptionAuxInfo: null,
+						};
+						this.currentFragment.trackData.set(track.id, trackData);
 					}
-				} else {
-					trackData = {
-						track,
-						currentTimestamp: 0,
-						currentOffset: track.currentFragmentState.baseDataOffset + (dataOffset ?? 0),
-						startTimestamp: 0,
-						endTimestamp: 0,
-						firstKeyFrameTimestamp: null,
-						samples: [],
-						presentationTimestamps: [],
-						startTimestampIsFinal: false,
-						trunSampleCounts: [],
-						encryptionAuxInfo: null,
-					};
-					this.currentFragment.trackData.set(track.id, trackData);
-				}
 
-				trackData.trunSampleCounts.push(sampleCount);
+					trackData.trunSampleCounts.push(sampleCount);
+				}
 
 				for (let i = 0; i < sampleCount; i++) {
 					let sampleDuration: number;
@@ -2644,22 +2655,21 @@ export class IsobmffDemuxer extends Demuxer {
 						sampleCompositionTimeOffset = readI32Be(slice);
 					}
 
-					const isKeyFrame = !(sampleFlags & 0x00010000);
-
-					trackData.samples.push({
-						presentationTimestamp: trackData.currentTimestamp + sampleCompositionTimeOffset,
+					trackData?.samples.push({
+						presentationTimestamp: fragmentTrackState.currentTimestamp + sampleCompositionTimeOffset,
 						duration: sampleDuration,
-						byteOffset: trackData.currentOffset,
+						byteOffset: currentOffset,
 						byteSize: sampleSize,
-						isKeyFrame,
+						isKeyFrame: !(sampleFlags & 0x00010000),
 						encryption: null,
 					});
 
-					trackData.currentOffset += sampleSize;
-					trackData.currentTimestamp += sampleDuration;
+					currentOffset += sampleSize;
+					fragmentTrackState.currentTimestamp += sampleDuration;
 				}
 
-				this.currentFragment.implicitBaseDataOffset = trackData.currentOffset;
+				fragmentTrackState.currentOffset = currentOffset;
+				this.currentFragment.implicitBaseDataOffset = currentOffset;
 			}; break;
 
 			case 'saiz': {
@@ -2689,7 +2699,7 @@ export class IsobmffDemuxer extends Demuxer {
 					sampleSizes = readBytes(slice, sampleCount);
 				}
 
-				const aux = getOrCreateEncryptionAuxInfo(track);
+				const aux = getOrCreateEncryptionAuxInfo(track, this.currentFragmentTrackState);
 				aux.defaultSampleInfoSize = defaultSampleInfoSize;
 				aux.sampleSizes = sampleSizes;
 				aux.sampleCount = sampleCount;
@@ -2723,12 +2733,13 @@ export class IsobmffDemuxer extends Demuxer {
 
 				let offset = version === 0 ? readU32Be(slice) : Number(readU64Be(slice));
 
-				// Per ISO/IEC 23001-7: when saio is inside a moof, offsets are relative to the start of the moof box.
+				// Per ISO/IEC 14496-12: when saio is inside a traf, offsets are relative to its base data offset
 				if (this.currentFragment) {
-					offset += this.currentFragment.moofOffset;
+					assert(this.currentFragmentTrackState);
+					offset += this.currentFragmentTrackState.baseDataOffset;
 				}
 
-				const aux = getOrCreateEncryptionAuxInfo(track);
+				const aux = getOrCreateEncryptionAuxInfo(track, this.currentFragmentTrackState);
 				aux.offset = offset;
 			}; break;
 
@@ -4154,9 +4165,12 @@ const capEntryCounts = (entries: { startIndex: number; count: number }[], sample
 	}
 };
 
-const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
-	if (track.currentFragmentState) {
-		return track.currentFragmentState.encryptionAuxInfo ??= {
+const getOrCreateEncryptionAuxInfo = (
+	track: InternalTrack,
+	fragmentTrackState: FragmentTrackState | null,
+) => {
+	if (fragmentTrackState) {
+		return fragmentTrackState.encryptionAuxInfo ??= {
 			defaultSampleInfoSize: 0,
 			sampleSizes: null,
 			sampleCount: 0,

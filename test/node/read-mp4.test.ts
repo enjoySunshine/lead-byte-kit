@@ -272,3 +272,124 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+const sampleData = (value: number) => [value, value, value, value];
+
+const videoSampleEntry = (name: string, ...children: Bytes[]) => box(
+	name, zeros(6), u16(1), zeros(16), u16(64), u16(64), zeros(50), ...children,
+);
+
+const mvhd = () => fullBox('mvhd', 0, 0, zeros(8), u32(1000), zeros(84));
+
+const trak = (handler: string, mediaHeader: Bytes, ...stblChildren: Bytes[]) => box('trak',
+	fullBox('tkhd', 0, 1, zeros(8), u32(1), zeros(68)),
+	box('mdia',
+		mediaHeader,
+		fullBox('hdlr', 0, 0, zeros(4), ascii(handler), zeros(13)),
+		box('minf', box('stbl', ...stblChildren)),
+	),
+);
+
+const mdhd = (timescale: number) => fullBox('mdhd', 0, 0, zeros(8), u32(timescale), zeros(8));
+
+type Bytes = Uint8Array | number[];
+
+const fullBox = (name: string, version: number, flags: number, ...parts: Bytes[]) => {
+	return box(name, u8(version), u24(flags), ...parts);
+};
+
+const box = (name: string, ...parts: Bytes[]) => {
+	const content = concat(...parts);
+	return concat(u32(8 + content.length), ascii(name), content);
+};
+
+const concat = (...parts: Bytes[]) => {
+	const result = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+	let offset = 0;
+	for (const part of parts) {
+		result.set(part, offset);
+		offset += part.length;
+	}
+
+	return result;
+};
+
+const u32 = (value: number) => [(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+const u24 = (value: number) => [(value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+const u16 = (value: number) => [(value >>> 8) & 0xff, value & 0xff];
+const u8 = (value: number) => [value & 0xff];
+const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+const zeros = (length: number) => new Uint8Array(length);
+
+// The timecode track's handler ('tmcd') isn't one we understand, so the demuxer ignores the track entirely
+const timecodeTrak = (trackId: number) => box('trak',
+	fullBox('tkhd', 0, 1, zeros(8), u32(trackId), zeros(68)),
+	box('mdia',
+		mdhd(1000),
+		fullBox('hdlr', 0, 0, zeros(4), ascii('tmcd'), zeros(13)),
+		box('minf', box('stbl', fullBox('stsd', 0, 0, u32(0)))),
+	),
+);
+
+// An omitted trun data offset continues where the previous traf's data ended, so an ignored track's trun (the
+// timecode track's, whose samples are padded before the video's) still shifts where the video samples live.
+const fragmentWithLeadingTimecodeTrack = (timecodeSampleCount: number) => {
+	const moov = box('moov',
+		mvhd(),
+		timecodeTrak(2),
+		trak('vide', mdhd(1000), fullBox('stsd', 0, 0, u32(1), videoSampleEntry('avc1'))),
+		box('mvex',
+			fullBox('trex', 0, 0, u32(2), u32(1), u32(40), u32(4), u32(0)),
+			fullBox('trex', 0, 0, u32(1), u32(1), u32(40), u32(4), u32(0)),
+		),
+	);
+	const moof = (dataOffset: number) => box('moof',
+		box('traf',
+			fullBox('tfhd', 0, 0, u32(2)),
+			fullBox('trun', 0, 0x000001, u32(timecodeSampleCount), u32(dataOffset)),
+		),
+		box('traf',
+			fullBox('tfhd', 0, 0, u32(1)),
+			fullBox('tfdt', 0, 0, u32(0)),
+			fullBox('trun', 0, 0x000001, u32(3), u32(0)),
+		),
+	);
+
+	const ftyp = box('ftyp', ascii('isom'), u32(0), ascii('isom'));
+	const timecodeSamples = new Uint8Array(4 * timecodeSampleCount).fill(0xff);
+
+	return concat(
+		ftyp,
+		moov,
+		moof(moof(0).length + 8),
+		box('mdat', timecodeSamples, sampleData(0), sampleData(1), sampleData(2)),
+	);
+};
+
+test('Fragments with omitted tfhd offsets and an ignored track first', async () => {
+	for (const timecodeSampleCount of [2, 1]) {
+		using input = new Input({
+			source: new BufferSource(fragmentWithLeadingTimecodeTrack(timecodeSampleCount)),
+			formats: ALL_FORMATS,
+		});
+
+		const inputTracks = await input.getTracks();
+		expect(inputTracks).toHaveLength(1);
+
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		expect(await track.getCodedWidth()).toBe(64);
+		expect(await track.getCodedHeight()).toBe(64);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		expect(packets.map(x => [...x.data])).toEqual([sampleData(0), sampleData(1), sampleData(2)]);
+		expect(packets.map(x => x.timestamp)).toEqual([0, 0.04, 0.08]);
+		expect(packets.map(x => x.duration)).toEqual([0.04, 0.04, 0.04]);
+		expect(packets.map(x => x.type)).toEqual(['key', 'key', 'key']);
+	}
+});
